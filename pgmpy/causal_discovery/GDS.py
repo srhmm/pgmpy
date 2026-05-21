@@ -34,7 +34,7 @@ class GDS(_BaseCausalDiscovery):
         score improvement exceeds ``min_improvement``; an incoming edge to ``source`` is removed if doing so decreases
         the local score by at most ``min_improvement``.
 
-    n_jobs : int, default=-1
+    n_jobs : int, default=1
         Number of jobs to use for parallel score computations. Parallelization is used in the initialization and
         backward phases to compute relative score improvements when adding and removing edges.
 
@@ -48,9 +48,6 @@ class GDS(_BaseCausalDiscovery):
 
     adjacency_matrix_ : pd.DataFrame
         Adjacency matrix representation of the learned causal graph.
-
-    priority_queue_ : Dict
-        Candidate directed edges to be added to the causal graph with priority values.
 
     n_features_in_ : int
         The number of features in the data used to learn the causal graph.
@@ -87,7 +84,7 @@ class GDS(_BaseCausalDiscovery):
         return_type: str = "dag",
         min_improvement: float = 1e-6,
         show_progress: bool = True,
-        n_jobs: int = -1,
+        n_jobs: int = 1,
     ):
         self.return_type = return_type
         self.scoring_method = scoring_method
@@ -103,19 +100,18 @@ class GDS(_BaseCausalDiscovery):
         X: pd.DataFrame
             The input dataset.
         """
-        # Step 0: Initialize scoring method and data structures
+        # Step 0: Initialize scoring method and data structures.
         score = get_scoring_method(scoring_method=self.scoring_method, data=X)
-        # the current learned graph
+
         dag_current = DAG()
         dag_current.add_nodes_from(list(X.columns))
         variables = list(dag_current.nodes)
-        # ordered candidate pairs with a priority score
-        self.priority_queue_ = {}
-        # unordered candidate pairs that can still be considered
-        remaining_pairs = {frozenset((x1, x2)) for x1, x2 in itertools.combinations(variables, 2)}
+
+        priority_queue = {}
+        candidate_pairs = {frozenset((x1, x2)) for x1, x2 in itertools.combinations(variables, 2)}
 
         def compare_local_score(parent, child, parent_parents=None, child_parents=None):
-            """Computes the relative score improvements of the edge (parent,child) over (child,parent)"""
+            """Computes the score preference of the edge parent->child over child->parent"""
             parent_parents = [] if parent_parents is None else parent_parents
             child_parents = [] if child_parents is None else child_parents
 
@@ -128,8 +124,7 @@ class GDS(_BaseCausalDiscovery):
             score_improvement = score_fw - score_bw
             return parent, child, score_improvement
 
-        # Step 1: Initialization phase, score each directed edge.
-        # edges_initial = list(itertools.combinations_with_replacement(variables, 2))
+        # Step 1: Initialize candidate edge priorities using pairwise score improvements.
         edges_initial = list(itertools.combinations(variables, 2))
 
         pbar_initial = tqdm(
@@ -147,17 +142,16 @@ class GDS(_BaseCausalDiscovery):
         )
 
         for x1, x2, phi in local_scores_initial:
-            if abs(phi) >= self.min_improvement:  # and  x1 != x2
-                self.priority_queue_.update({(x1, x2): phi, (x2, x1): -phi})
+            if abs(phi) >= self.min_improvement:
+                priority_queue.update({(x1, x2): phi, (x2, x1): -phi})
 
-        # Step 2: Greedy forward/backward search.
         converged = False
 
+        # Step 2: Greedy forward/backward search.
         while not converged:
-            # Step 2.1: Forward phase, add directed edges by priority,
-            #  updating other edge scores whenever necessary
+            # Step 2.1: Forward phase. Greedily add valid edges by priority.
             forward_converged = True
-            if len(self.priority_queue_) == 0:
+            if len(priority_queue) == 0:
                 converged = True
                 continue
 
@@ -167,18 +161,17 @@ class GDS(_BaseCausalDiscovery):
                 disable=not (self.show_progress and config.SHOW_PROGRESS),
             )
 
-            while len(self.priority_queue_) > 0:
-                parent, child = max(self.priority_queue_, key=self.priority_queue_.get)
-                curr_priority = self.priority_queue_[(parent, child)]
+            while len(priority_queue) > 0:
+                # Step 2.1.1: Select the currently strongest directed edge candidate.
+                parent, child = max(priority_queue, key=priority_queue.get)
+                curr_priority = priority_queue[(parent, child)]
 
-                # remove forward and backward directions from consideration
-                del self.priority_queue_[(parent, child)]
+                del priority_queue[(parent, child)]
+                if parent != child and (child, parent) in priority_queue:
+                    del priority_queue[(child, parent)]
+                candidate_pairs.discard(frozenset((parent, child)))
 
-                if parent != child and (child, parent) in self.priority_queue_:
-                    del self.priority_queue_[(child, parent)]
-
-                remaining_pairs.discard(frozenset((parent, child)))
-
+                # Step 2.1.2: Add the directed edge candidate if it is valid and improves the score.
                 has_cycle = nx.has_path(dag_current, child, parent)
                 no_improvement = curr_priority < self.min_improvement
 
@@ -187,15 +180,15 @@ class GDS(_BaseCausalDiscovery):
                     pbar_forward.set_postfix_str(f"edges={dag_current.number_of_edges()}")
                     continue
 
-                # add edge and update priority scores
                 dag_current.add_edge(parent, child)
-                forward_converged = False  # whenever at least one edge was added, go into backward phase as well
+                forward_converged = False
 
+                # Step 2.1.3: Update scores of other candidate parents of the child.
                 curr_parents = list(dag_current.predecessors(child))
                 cand_parents = [
                     cand_parent
                     for cand_parent in variables
-                    if cand_parent != child and frozenset((cand_parent, child)) in remaining_pairs
+                    if cand_parent != child and frozenset((cand_parent, child)) in candidate_pairs
                 ]
                 local_scores_current = [
                     compare_local_score(cand_parent, child, list(dag_current.predecessors(cand_parent)), curr_parents)
@@ -203,9 +196,7 @@ class GDS(_BaseCausalDiscovery):
                 ]
 
                 for cand_parent, cand_child, cand_phi in local_scores_current:
-                    self.priority_queue_.update(
-                        {(cand_parent, cand_child): cand_phi, (cand_child, cand_parent): -cand_phi}
-                    )
+                    priority_queue.update({(cand_parent, cand_child): cand_phi, (cand_child, cand_parent): -cand_phi})
 
                 pbar_forward.update(1)
                 pbar_forward.set_postfix_str(f"edges={dag_current.number_of_edges()}")
@@ -215,7 +206,7 @@ class GDS(_BaseCausalDiscovery):
                 converged = True
                 continue
 
-            # Step 2.2: Backward phase, remove directed whenever necessary.
+            # Step 2.2: Backward phase. Prune edges if edge removal is within score tolerance.
             backward_converged = True
 
             pbar_backward = tqdm(
@@ -233,6 +224,7 @@ class GDS(_BaseCausalDiscovery):
                     if len(curr_parents) <= 1:
                         continue
 
+                    # Step 2.2.1: Evaluate all parent sets obtained by removing one current parent.
                     s_full = score.local_score(node, tuple(curr_parents))
                     set_size = len(curr_parents) - 1
                     sets = itertools.combinations(curr_parents, set_size)
@@ -255,6 +247,7 @@ class GDS(_BaseCausalDiscovery):
                             s_full = s_trunc
                             best_s = parent_set
 
+                    # Step 2.2.2: Remove the best parent if pruning is within tolerance.
                     if edge_removed and best_s is not None:
                         removed_parent = list(set(curr_parents) - set(best_s))[0]
                         dag_current.remove_edge(removed_parent, node)
