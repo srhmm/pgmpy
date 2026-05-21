@@ -134,14 +134,16 @@ class GDS(_BaseCausalDiscovery):
 
         pbar_initial = tqdm(
             edges_initial,
-            desc="Initializing candidate edges",
-            unit="pair",
+            desc="Initial scoring of candidate edges",
+            unit="edge(s)",
             disable=not (self.show_progress and config.SHOW_PROGRESS),
         )
         local_scores_initial = (
             [compare_local_score(x1, x2) for x1, x2 in pbar_initial]
             if self.n_jobs == 1
-            else Parallel(n_jobs=self.n_jobs)(delayed(compare_local_score)(x1, x2) for x1, x2 in pbar_initial)
+            else Parallel(n_jobs=self.n_jobs, prefer="threads")(
+                delayed(compare_local_score)(x1, x2) for x1, x2 in pbar_initial
+            )
         )
 
         for x1, x2, phi in local_scores_initial:
@@ -155,11 +157,16 @@ class GDS(_BaseCausalDiscovery):
             # Step 2.1: Forward phase, add directed edges by priority,
             #  updating other edge scores whenever necessary
             forward_converged = True
+            if len(self.priority_queue_) == 0:
+                converged = True
+                continue
+
             pbar_forward = tqdm(
                 desc="Forward phase",
-                unit="edge",
+                unit="edge(s)",
                 disable=not (self.show_progress and config.SHOW_PROGRESS),
             )
+
             while len(self.priority_queue_) > 0:
                 parent, child = max(self.priority_queue_, key=self.priority_queue_.get)
                 curr_priority = self.priority_queue_[(parent, child)]
@@ -214,7 +221,7 @@ class GDS(_BaseCausalDiscovery):
             pbar_backward = tqdm(
                 variables,
                 desc="Backward phase",
-                unit="node",
+                unit="node(s)",
                 disable=not (self.show_progress and config.SHOW_PROGRESS),
             )
             for node in pbar_backward:
@@ -237,7 +244,7 @@ class GDS(_BaseCausalDiscovery):
                             for child, parent_set in edges_backward
                         ]
                     else:
-                        scores = Parallel(n_jobs=self.n_jobs)(
+                        scores = Parallel(n_jobs=self.n_jobs, prefer="threads")(
                             delayed(score.local_score)(child, tuple(parent_set)) for child, parent_set in edges_backward
                         )
                         local_scores_current = list(zip(scores, [parent_set for _, parent_set in edges_backward]))
